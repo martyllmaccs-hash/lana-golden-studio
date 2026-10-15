@@ -1,0 +1,304 @@
+diff --git a/holo-ref/shell.qml b/holo-golden/shell.qml
+--- a/holo-ref/shell.qml
++++ b/holo-golden/shell.qml
+@@ -1,5 +1,9 @@
+-// holo — the orchestration lattice: a holographic view of the agent fleet across both
+-// machines, live from the Hermes session stores. Non-interactive background layer (current live baseline).
++// holo-golden — the orchestration lattice, re-themed to match the living studio
++// wallpaper behind it: a holographic view of the agent fleet across both machines,
++// live from the Hermes session stores, now in warm brass/candle-gold instead of
++// cyan (BRIEF-2/BRIEF-3's "gold-holo merge"). Patched copy of holo-ref/shell.qml --
++// see DIFF.patch for the exact diff; data plumbing (fleet/beacon reads, Renderer.js,
++// Drift.js, the `drift`/`sweep` IPC) is untouched.
+ //
+ // Data: ~/.local/state/holo/fleet.json (this machine, written by
+ // holo-collector.service) plus, when the local collector has not merged it yet,
+@@ -22,7 +26,7 @@
+   readonly property string stateDir: home + "/.local/state/holo/"
+   readonly property string fleetPath: stateDir + "fleet.json"
+   readonly property string beaconPath: stateDir + "beacon-vps.json"
+-  readonly property string assetDir: "file://" + home + "/.config/quickshell/holo/assets/"
++  readonly property string assetDir: "file://" + home + "/.config/quickshell/holo-golden/assets/"
+ 
+   property var fleet: null
+   property var beacon: null
+@@ -44,18 +48,81 @@
+   property int omitted: 0
+   property int collisions: 0
+ 
+-  readonly property color cyan: "#7ff0ff"
+-  readonly property color dim: "#3d6f7d"
++  // ---- warm palette (BRIEF-2/BRIEF-3 gold-holo merge) --------------------
++  // Picked from ref/wallpaper-1080p.jpg's own light (sampled with Pillow --
++  // see README "Palette picks" for the exact regions/hex output this is
++  // drawn from): brass/amber in place of cyan, cream in place of cyan-pale.
++  // Pulses, the link lines and every node's lit-state accent all cool
++  // towards `nightSilver` as the room itself goes to moonlight, via
++  // `nightAmount` below -- everything else (labels, stats, headers) stays a
++  // static warm tone so small text never fights for legibility at night.
++  readonly property color gold: "#e8a84c"         // ember/amber -- working glow (was cyan #7ff0ff)
++  readonly property color dim: "#a8674a"          // soft terracotta -- idle/dim (was #3d6f7d / #2f7c8c)
++  readonly property color lineGold: "#b8864a"      // thin gilded link threads (was rgba(47,124,140,.55))
++  readonly property color pulseCream: "#fff2da"    // cream-white -- the standard (handoff) pulse
++  readonly property color pulsePale: "#f3d3a5"     // pale warm gold -- a2a pulses (was #d8f6ff)
++  readonly property color pulseHilite: "#ffe3ad"   // bright pale gold -- message pulses + totals text
++  readonly property color nightSilver: "#8cadf2"   // moonlit silver-blue -- == studio's own moonGlow tint
++
++  // 0 (day) .. 1 (deep night), same keyframes as studio.frag's ANCH_NIGHT
++  // column, so the fleet's gold cools in lockstep with the room behind it.
++  function nightAmountAt(h) {
++    var H = [0.0, 5.0, 7.0, 12.0, 17.0, 19.5, 21.0, 24.0]
++    var N = [1.00, 1.00, 0.00, 0.00, 0.00, 0.40, 0.90, 1.00]
++    h = ((h % 24) + 24) % 24
++    for (var i = 0; i < H.length - 1; i++) {
++      if (h >= H[i] && h <= H[i + 1]) {
++        var t = (h - H[i]) / Math.max(H[i + 1] - H[i], 0.0001)
++        t = t * t * (3.0 - 2.0 * t)
++        return N[i] + (N[i + 1] - N[i]) * t
++      }
++    }
++    return N[0]
++  }
++  function mixColor(a, b, t) {
++    return Qt.rgba(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t,
++                    a.b + (b.b - a.b) * t, a.a + (b.a - a.a) * t)
++  }
++  function rgbaStr(c, a) {
++    return "rgba(" + Math.round(c.r * 255) + "," + Math.round(c.g * 255) + ","
++         + Math.round(c.b * 255) + "," + a + ")"
++  }
++
++  property real nightAmount: nightAmountAt(backdrop.dayPhase)
++  readonly property color goldNow: mixColor(root.gold, root.nightSilver, root.nightAmount)
++  readonly property color lineGoldNow: mixColor(root.lineGold, root.nightSilver, root.nightAmount)
++  readonly property color pulseCreamNow: mixColor(root.pulseCream, root.nightSilver, root.nightAmount)
++  readonly property color pulsePaleNow: mixColor(root.pulsePale, root.nightSilver, root.nightAmount)
++  readonly property color pulseHiliteNow: mixColor(root.pulseHilite, root.nightSilver, root.nightAmount)
++  readonly property color dimNow: mixColor(root.dim, root.nightSilver, root.nightAmount)
+ 
+   function value(v) { return v === null || v === undefined ? "?" : v }
+   // Pulse tint by event kind -- every colour already exists elsewhere in the
+-  // fleet's own palette (handoff = the standard cyan; a2a/message/smoke-test
+-  // get their own existing accent so the pulse stream reads apart by kind).
++  // fleet's own (now warm) palette: handoff is the standard cream-white
++  // pulse, a2a/message/smoke-test get their own existing accent so the
++  // pulse stream still reads apart by kind, just within the gold family.
+   function pulseColor(kind) {
+-    if (kind === "handoff") return root.cyan
+-    if (kind === "a2a") return "#d8f6ff"
+-    if (kind === "smoke_test") return "#2f7c8c"
+-    return "#a8f7ff"
++    if (kind === "handoff") return root.pulseCreamNow
++    if (kind === "a2a") return root.pulsePaleNow
++    if (kind === "smoke_test") return root.dimNow
++    return root.pulseHiliteNow
++  }
++
++  // Same backdrop control surface as the standalone studio/ config (just one
++  // instance here, so no fan-out is needed -- see StudioBackdrop.qml).
++  IpcHandler {
++    target: "studio"
++
++    function phase(h: real) { backdrop.forcedPhase = h }
++    function speed(s: real) { backdrop.speed = s }
++    function motion(m: real) { backdrop.motion = m }
++    function signature() { backdrop.signature() }
++    function status(): string {
++      return JSON.stringify({
++        time: backdrop.time, dayPhase: backdrop.dayPhase,
++        forcedPhase: backdrop.forcedPhase, motion: backdrop.motion, fps: backdrop.fps
++      })
++    }
+   }
+ 
+   // Read-only runtime proof: actual transformed centres versus drawn endpoints.
+@@ -198,6 +265,33 @@
+   }
+ 
+   // ================================================================ surface
++  // The living studio backdrop is a SEPARATE full-screen Background-layer
++  // window, created first so it paints below the nodes panel. holo's node
++  // panel measures ~1887x1045 (not full screen -- see BRIEF-3's finding),
++  // but Martin loved the studio extending edge-to-edge under his transparent
++  // top bar, so the backdrop gets its own window sized by anchors alone
++  // (no implicitWidth/Height override) instead of matching the node panel's
++  // narrower geometry. Node layout is completely unaffected: `panel` below
++  // keeps its exact original anchors/size/content, just without its own
++  // background fill.
++  PanelWindow {
++    id: backdropPanel
++
++    anchors { top: true; bottom: true; left: true; right: true }
++    color: "black"
++    exclusionMode: ExclusionMode.Ignore
++    mask: Region {}
++
++    WlrLayershell.layer: WlrLayer.Background
++    WlrLayershell.namespace: "holo-golden-backdrop"
++    WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
++
++    StudioBackdrop {
++      id: backdrop
++      anchors.fill: parent
++    }
++  }
++
+   PanelWindow {
+     id: panel
+ 
+@@ -211,20 +305,13 @@
+     // behind every normal window, so it reads as a live desktop background rather
+     // than an overlay sitting on top of the user's work.
+     WlrLayershell.layer: WlrLayer.Background
+-    WlrLayershell.namespace: "holo"
++    WlrLayershell.namespace: "holo-golden"
+     WlrLayershell.keyboardFocus: WlrKeyboardFocus.None
+     mask: Region {}
+ 
+-    // Martin's photo is the background; the live bot fleet remains layered above it.
+-    // Keep the photo clean: no galaxy, grid, stars, or scanline wash over the subject.
+-    Rectangle { anchors.fill: parent; color: "black" }
+-    Image {
+-      width: parent.width; height: parent.height
+-      x: -parent.width * 0.025; y: 0
+-      source: root.assetDir + "background.jpg"
+-      fillMode: Image.Stretch
+-      smooth: true
+-    }
++    // The live studio backdrop (backdropPanel, above) now supplies the
++    // background photo + light/motion across the full screen; this panel
++    // stays transparent and only carries the fleet overlay.
+ 
+     // ------------------------------------------------------------- links
+     Canvas {
+@@ -248,7 +335,8 @@
+           ctx.moveTo(x0, y0)
+           ctx.quadraticCurveTo(x1, y1, x2, y2)
+           // Quiet solid topology lines; inference stays in metadata, not dashes.
+-          ctx.strokeStyle = "rgba(47,124,140,0.55)"
++          // Thin gilded threads in the haze -- cools to moonlit silver with the room.
++          ctx.strokeStyle = root.rgbaStr(root.lineGoldNow, 0.55)
+           ctx.setLineDash([])
+           ctx.stroke()
+           ctx.setLineDash([])
+@@ -301,20 +389,23 @@
+         breathe: root.breathe
+         phase: (index % 7) * 0.14
+         glowSprite: root.assetDir + "glow-node.png"
++        nightAmount: root.nightAmount
+       }
+     }
+ 
+     // ------------------------------------------------------------ headers
++    // Static warm brass (not night-blended): small UI text stays legible and
++    // steady regardless of time of day, only the fleet's own glow cools.
+     Text {
+       x: 395 - width / 2; y: 120
+       text: "VPS · RUNTIME"
+-      color: "#5fb6c9"
++      color: "#c9975f"
+       font.family: "Noto Sans Mono"; font.pixelSize: 14; font.letterSpacing: 4
+     }
+     Text {
+       x: panel.width - 395 - width / 2; y: 120
+       text: "P1 · WORKSTATION"
+-      color: "#5fb6c9"
++      color: "#c9975f"
+       font.family: "Noto Sans Mono"; font.pixelSize: 14; font.letterSpacing: 4
+     }
+     // totals
+@@ -325,13 +416,13 @@
+         text: "NODES " + root.value(root.totals.nodes_online)
+               + "/" + root.value(root.totals.nodes_total)
+               + "   WORKING " + (root.value(root.totals.working) + (root.totals.working_unknown ? " +?" : ""))
+-        color: "#a8f7ff"
++        color: "#ffe3ad"
+         font.family: "Noto Sans Mono"; font.pixelSize: 13; font.letterSpacing: 2
+       }
+       Text {
+         text: "VISIBLE TOKENS " + (root.totals.tokens_today !== undefined && root.totals.tokens_today !== null ? (root.totals.tokens_today / 1e6).toFixed(1) + "M" : "-")
+               + "   BEACON " + (root.beaconAge >= 0 ? root.ageStr(root.beaconAge) : "NONE")
+-        color: root.vpsStale ? "#c9a227" : "#5fb6c9"
++        color: root.vpsStale ? "#d46a2b" : "#c9975f"
+         font.family: "Noto Sans Mono"; font.pixelSize: 12; font.letterSpacing: 2
+       }
+     }
+
+diff --git a/holo-ref/HoloNode.qml b/holo-golden/HoloNode.qml
+--- a/holo-ref/HoloNode.qml
++++ b/holo-golden/HoloNode.qml
+@@ -1,5 +1,8 @@
+ // HoloNode — one agent in the orchestration lattice: a glowing disc, a name, a state
+ // word, and the numbers behind it. Idle nodes are dim; working nodes breathe.
++// Patched for holo-golden (BRIEF-2/BRIEF-3): warm brass/amber accents in place of
++// cyan, cooling towards moonlit silver-blue at night via `nightAmount`. UNLINKED
++// stays a static alarm red regardless of time of day -- errors shouldn't soften.
+ import QtQuick
+ import "Renderer.js" as Renderer
+ 
+@@ -26,15 +29,23 @@
+   property string glowSprite: ""
+   property real disc: 54
+   property bool labelOnLeft: false
++  property real nightAmount: 0       // 0 (day) .. 1 (deep night), from the shell's studio-backdrop phase
+ 
+   property bool working: state === "ACTIVE" || state === "TOOLING" || state === "THINKING" || state === "WORKING"
+   readonly property real beat: 0.5 + 0.5 * Math.sin((node.breathe + node.phase) * 6.283185)
+-  readonly property color accent:
+-      state === "UNLINKED" ? "#7a3030"
+-    : (state === "OFFLINE" || state === "IDLE") ? "#2f7c8c"
+-    : state === "UNKNOWN" ? "#7a7452"
+-    : state === "THINKING" ? "#d8f6ff"
+-    : "#7ff0ff"
++  readonly property color nightSilver: "#8cadf2"
++  function mixColor(a, b, t) {
++    return Qt.rgba(a.r + (b.r - a.r) * t, a.g + (b.g - a.g) * t,
++                    a.b + (b.b - a.b) * t, a.a + (b.a - a.a) * t)
++  }
++  readonly property color accent: {
++    if (state === "UNLINKED") return "#7a3030"   // alarm red stays put at any hour
++    var base = (state === "OFFLINE" || state === "IDLE") ? "#a8674a"   // soft terracotta
++      : state === "UNKNOWN" ? "#9c8a5a"                                 // warm olive
++      : state === "THINKING" ? "#f3d3a5"                                // pale warm gold
++      : "#e8a84c"                                                       // ember/amber -- working
++    return node.mixColor(base, node.nightSilver, node.nightAmount)
++  }
+   readonly property real lit: working ? 1.0 : (state === "IDLE" ? 0.42 : 0.30)
+ 
+   property real layoutScale: 1
+@@ -68,7 +79,7 @@
+     width: node.disc
+     height: node.disc
+     radius: node.disc / 2
+-    color: "#04121a"
++    color: "#140d08"
+     border.width: node.working ? 2 : 1
+     border.color: Qt.rgba(node.accent.r, node.accent.g, node.accent.b, 0.35 + 0.65 * node.lit)
+     Behavior on border.color { ColorAnimation { duration: 400 } }
+@@ -90,7 +101,7 @@
+     radius: width / 2
+     color: "transparent"
+     border.width: 1
+-    border.color: "#a8f7ff"
++    border.color: node.mixColor(Qt.rgba(1.0, 0.890, 0.678, 1.0), node.nightSilver, node.nightAmount)
+     opacity: node.lease === true ? 0.35 + 0.45 * node.beat : 0.0
+     visible: node.lease === true
+   }
+@@ -118,7 +129,7 @@
+       horizontalAlignment: node.labelOnLeft ? Text.AlignRight : Text.AlignLeft
+       elide: Text.ElideRight
+       text: node.label
+-      color: node.working ? "#e8fdff" : "#7fb6c4"
++      color: node.working ? "#fff6e8" : "#c9a688"
+       font.family: "Noto Sans Mono"; font.pixelSize: 17; font.bold: true; font.letterSpacing: 2
+     }
+     Text {
+@@ -142,7 +153,7 @@
+         if (node.alive === null) bits.push("LIVE ?")
+         return bits.join(" · ")
+       }
+-      color: "#4f8fa0"
++      color: "#a08060"
+       font.family: "Noto Sans Mono"; font.pixelSize: 10; font.letterSpacing: 1
+     }
+   }

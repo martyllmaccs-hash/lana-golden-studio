@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Golden Hour Studio — preview</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: #000; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+  #fleetOverlay { position: fixed; top: 0; left: 0; pointer-events: none; }
+
+  #hud {
+    position: fixed;
+    left: 50%;
+    bottom: 18px;
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 10px 16px;
+    border-radius: 999px;
+    background: rgba(20, 14, 10, 0.55);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border: 1px solid rgba(255, 220, 180, 0.15);
+    color: #f1e4d2;
+    font: 12px/1.4 -apple-system, "Segoe UI", sans-serif;
+    user-select: none;
+    z-index: 10;
+  }
+  #hud label { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+  #hud input[type="range"] { width: 120px; accent-color: #e8a85c; }
+  #hud input[type="checkbox"] { accent-color: #e8a85c; }
+  #hud button {
+    background: rgba(232, 168, 92, 0.18);
+    border: 1px solid rgba(232, 168, 92, 0.45);
+    color: #f1e4d2;
+    border-radius: 999px;
+    padding: 5px 12px;
+    font: inherit;
+    cursor: pointer;
+  }
+  #hud button:hover { background: rgba(232, 168, 92, 0.32); }
+  #hud .readout { min-width: 42px; text-align: right; opacity: 0.85; font-variant-numeric: tabular-nums; }
+  #hud.dim { opacity: 0.35; transition: opacity 0.4s; }
+  #hud:hover, #hud.dim:hover { opacity: 1; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<canvas id="fleetOverlay"></canvas>
+
+<div id="hud">
+  <label>
+    time
+    <input id="phaseSlider" type="range" min="0" max="24" step="0.05" value="12" />
+    <span id="phaseReadout" class="readout">12:00</span>
+  </label>
+  <label><input id="realClock" type="checkbox" checked /> real clock</label>
+  <label>
+    speed
+    <input id="speedSlider" type="range" min="0.1" max="8" step="0.1" value="1" />
+    <span id="speedReadout" class="readout">1.0x</span>
+  </label>
+  <label>
+    motion
+    <input id="motionSlider" type="range" min="0" max="4" step="0.1" value="2" />
+    <span id="motionReadout" class="readout">2.0x</span>
+  </label>
+  <label><input id="fleetToggle" type="checkbox" /> holo-golden fleet</label>
+  <button id="sigBtn">signature</button>
+</div>
+
+<!-- build_preview.py injects a JSON blob of base64 data URIs here for the
+     standalone single-file build. When absent (plain `index.html` served
+     from preview/), assets are fetched from ../studio/assets/ instead. -->
+<!-- EMBEDDED_ASSETS_PLACEHOLDER -->
+
+<script>
+"use strict";
+
+const ASSET_PATHS = {
+  base: "../studio/assets/base.jpg",
+  light: "../studio/assets/light.png",
+  floor: "../studio/assets/floor.png",
+  windows: "../studio/assets/windows.png",
+  air: "../studio/assets/air.png",
+};
+
+function embeddedAssets() {
+  const el = document.getElementById("embedded-assets");
+  if (!el) return null;
+  try { return JSON.parse(el.textContent); } catch (e) { return null; }
+}
+
+const VERT_SRC = `#version 300 es
+out vec2 v_uv;
+void main() {
+    vec2 t = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+    gl_Position = vec4(t * 2.0 - 1.0, 0.0, 1.0);
+    v_uv = vec2(t.x, 1.0 - t.y);
+}
+`;
+
+// Port of studio/shaders/studio.frag -- same math, GLSL ES 3.00 / WebGL2
+// uniform style (plain uniforms instead of a std140 block). Keep in sync
+// with the .frag by hand; there is no shared source of truth between the
+// two targets (Qt6 GLSL 440 vs GLSL ES 300).
+const FRAG_SRC = `#version 300 es
+precision highp float;
+
+in vec2 v_uv;
+out vec4 outColor;
+
+uniform float u_time;
+uniform float u_dayPhase;
+uniform float u_signatureStart;
+uniform vec2 u_resolution;
+uniform float u_motion;
+
+uniform sampler2D u_baseTex;
+uniform sampler2D u_lightTex;
+uniform sampler2D u_floorTex;
+uniform sampler2D u_windowsTex;
+uniform sampler2D u_airTex;
+
+float hash12(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * 0.1031);
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+vec2 hash22(vec2 p) {
+    vec3 p3 = fract(vec3(p.xyx) * vec3(0.1031, 0.1030, 0.0973));
+    p3 += dot(p3, p3.yzx + 33.33);
+    return fract((p3.xx + p3.yz) * p3.zy);
+}
+
+float vnoise(vec2 p) {
+    vec2 i = floor(p);
+    vec2 f = fract(p);
+    float a = hash12(i);
+    float b = hash12(i + vec2(1.0, 0.0));
+    float c = hash12(i + vec2(0.0, 1.0));
+    float d = hash12(i + vec2(1.0, 1.0));
+    vec2 u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+float fbm(vec2 p) {
+    float v = 0.0;
+    float amp = 0.55;
+    for (int i = 0; i < 3; i++) {
+        v += amp * vnoise(p);
+        p *= 2.03;
+        amp *= 0.5;
+    }
+    return v;
+}
+
+const int NANCH = 8;
+const float ANCH_H[8]  = float[8](0.0,  5.0,  7.0,  12.0, 17.0, 19.5, 21.0, 24.0);
+const float ANCH_TR[8] = float[8](0.72, 0.72, 0.93, 1.00, 1.12, 1.08, 0.78, 0.72);
+const float ANCH_TG[8] = float[8](0.80, 0.80, 0.95, 1.00, 0.98, 0.82, 0.82, 0.80);
+const float ANCH_TB[8] = float[8](1.04, 1.04, 0.99, 1.00, 0.80, 0.78, 1.05, 1.04);
+const float ANCH_EXP[8]   = float[8](0.44, 0.44, 0.80, 1.00, 1.06, 0.80, 0.52, 0.44);
+const float ANCH_BEAM[8]  = float[8](0.20, 0.20, 0.68, 0.85, 1.00, 0.55, 0.28, 0.20);
+const float ANCH_DUST[8]  = float[8](0.10, 0.10, 0.55, 0.78, 1.00, 0.68, 0.16, 0.10);
+const float ANCH_NIGHT[8] = float[8](1.00, 1.00, 0.00, 0.00, 0.00, 0.40, 0.90, 1.00);
+
+void gradeAt(float h, out vec3 tint, out float exposure, out float beamMul, out float dustMul, out float nightBlue) {
+    tint = vec3(ANCH_TR[0], ANCH_TG[0], ANCH_TB[0]);
+    exposure = ANCH_EXP[0]; beamMul = ANCH_BEAM[0];
+    dustMul = ANCH_DUST[0]; nightBlue = ANCH_NIGHT[0];
+    for (int i = 0; i < NANCH - 1; i++) {
+        if (h >= ANCH_H[i] && h <= ANCH_H[i + 1]) {
+            float t = (h - ANCH_H[i]) / max(ANCH_H[i + 1] - ANCH_H[i], 0.0001);
+            t = t * t * (3.0 - 2.0 * t);
+            tint = vec3(
+                mix(ANCH_TR[i], ANCH_TR[i + 1], t),
+                mix(ANCH_TG[i], ANCH_TG[i + 1], t),
+                mix(ANCH_TB[i], ANCH_TB[i + 1], t)
+            );
+            exposure = mix(ANCH_EXP[i], ANCH_EXP[i + 1], t);
+            beamMul = mix(ANCH_BEAM[i], ANCH_BEAM[i + 1], t);
+            dustMul = mix(ANCH_DUST[i], ANCH_DUST[i + 1], t);
+            nightBlue = mix(ANCH_NIGHT[i], ANCH_NIGHT[i + 1], t);
+            return;
+        }
+    }
+}
+
+void main() {
+    vec2 uv = v_uv;
+    float aspect = u_resolution.x / max(u_resolution.y, 1.0);
+    vec2 auv = vec2(uv.x * aspect, uv.y);
+
+    vec4 baseColor = texture(u_baseTex, uv);
+    float lightMask = texture(u_lightTex, uv).r;
+    float floorMask = texture(u_floorTex, uv).r;
+    float windowsMask = texture(u_windowsTex, uv).r;
+    float airMask = texture(u_airTex, uv).r;
+    float baseLum = dot(baseColor.rgb, vec3(0.299, 0.587, 0.114));
+
+    float h = mod(u_dayPhase, 24.0);
+    vec3 gradeTint;
+    float exposure, beamMul, dustMul, nightBlue;
+    gradeAt(h, gradeTint, exposure, beamMul, dustMul, nightBlue);
+
+    vec3 col = baseColor.rgb;
+
+    float sig = 0.0;
+    {
+        const float dur = 6.5;
+        float elapsed = u_time - u_signatureStart;
+        if (elapsed >= 0.0 && elapsed <= dur) {
+            float prog = elapsed / dur;
+            float envelope = smoothstep(0.0, 0.18, prog) * (1.0 - smoothstep(0.80, 1.0, prog));
+            float sweepX = mix(-0.30, 1.30, prog);
+            float d = (uv.x + 0.16 * uv.y) - sweepX;
+            float band = exp(-(d * d) / (2.0 * 0.05 * 0.05));
+            sig = band * envelope;
+        }
+    }
+
+    vec2 lightDir = normalize(vec2(1.0, 0.35));
+    float shimmer = fbm(auv * 3.1 - lightDir * u_time * 0.040);
+    float breathe = 0.78 + 0.34 * shimmer;
+    vec2 raySrc = vec2(-0.05 * aspect, 0.08);
+    vec2 toP = auv - raySrc;
+    float ang = atan(toP.y, toP.x);
+    float raySweep = radians(4.0) * sin(u_time * 0.015);
+    float angS = ang + raySweep;
+    float ray0 = 1.0 - smoothstep(0.0, 0.32, abs(sin((angS - 0.28) * 7.0 + u_time * 0.06)));
+    float ray1 = 1.0 - smoothstep(0.0, 0.27, abs(sin((angS - 0.55) * 9.0 - u_time * 0.044)));
+    float rays = (ray0 + 0.7 * ray1) * smoothstep(0.0, 0.5, lightMask);
+    float beamStrength = (0.65 * breathe + 0.5 * rays) * lightMask * beamMul;
+    vec3 beamColor = mix(vec3(1.0, 0.93, 0.78), vec3(0.80, 0.88, 1.0), nightBlue);
+    float beamAtten = pow(1.0 - baseLum, 2.0);
+    col += beamColor * beamStrength * 0.22 * u_motion * beamAtten;
+    col += vec3(1.0, 0.95, 0.82) * sig * (0.28 + 0.5 * lightMask);
+
+    vec2 cloudDir = normalize(vec2(1.0, 0.18));
+    const float cloudPeriod = 30.0;
+    float cloud = fbm(auv * 1.15 - cloudDir * (u_time / cloudPeriod) * 1.4 + 11.0);
+    float cloudShadow = min(smoothstep(0.42, 0.62, cloud) * 0.10 * u_motion, 0.6);
+    col *= (1.0 - cloudShadow);
+
+    float dust = 0.0;
+    {
+        vec2 grid = vec2(14.0, 8.0);
+        vec2 cell0 = floor(uv * grid);
+        float twinkleBoost = 1.0 + 0.6 * sig;
+        for (int dy = -1; dy <= 1; dy++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                vec2 cell = cell0 + vec2(float(dx), float(dy));
+                vec2 seed = hash22(cell + 0.5);
+                float riseSpeed = 0.020 + seed.x * 0.024;
+                float yLocal = fract(seed.y + u_time * riseSpeed);
+                float wanderPhase = seed.x * 62.831853;
+                float wx = 0.30 * sin(u_time * (0.10 + 0.08 * seed.y) + wanderPhase);
+                vec2 moteUV;
+                moteUV.x = (cell.x + 0.5 + wx) / grid.x;
+                moteUV.y = (cell.y + (1.0 - yLocal)) / grid.y;
+                vec2 d = uv - moteUV;
+                d.x *= aspect;
+                float sizeHash = hash12(cell + 3.3);
+                float sizeMul = sizeHash > 0.80 ? mix(1.6, 3.0, (sizeHash - 0.80) / 0.20) : 1.0;
+                float size = mix(0.0016, 0.0040, seed.y) * sizeMul;
+                float fall = exp(-dot(d, d) / (size * size));
+                float twinkle = (0.55 + 0.45 * sin(u_time * (1.3 + seed.x * 1.6) + wanderPhase)) * twinkleBoost;
+                twinkle *= mix(1.0, 0.7, step(1.0, sizeMul));
+                dust += fall * twinkle;
+            }
+        }
+        dust = min(dust, 1.4);
+    }
+    vec3 moteColor = mix(vec3(1.0, 0.86, 0.55), vec3(0.75, 0.82, 0.95), nightBlue);
+    col += moteColor * dust * airMask * dustMul * 0.55 * u_motion;
+
+    vec2 streakDir = normalize(vec2(1.0, 0.22));
+    float sheenWave = 0.5 + 0.5 * sin(dot(auv, streakDir) * 26.0 - u_time * 0.24);
+    float sparkle = hash12(floor(auv * 180.0) + floor(u_time * 0.6));
+    float sheen = floorMask * (0.5 * sheenWave + 0.5 * smoothstep(0.88, 1.0, sparkle));
+    col += vec3(1.0, 0.94, 0.80) * sheen * 0.05 * beamMul * u_motion;
+
+    col *= gradeTint;
+    col *= exposure;
+
+    col *= (1.0 - nightBlue * floorMask * 0.35);
+
+    vec3 moonGlow = vec3(0.55, 0.68, 0.95) * windowsMask * nightBlue * 0.30;
+    vec3 herGlow = vec3(1.0, 0.82, 0.58) * lightMask * nightBlue * 0.085;
+    col += moonGlow + herGlow;
+
+    col = clamp(col, 0.0, 1.0);
+    outColor = vec4(col, baseColor.a);
+}
+`;
+
+function compile(gl, type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    throw new Error("shader compile error: " + gl.getShaderInfoLog(sh));
+  }
+  return sh;
+}
+
+function link(gl, vsSrc, fsSrc) {
+  const prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl, gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(prog, compile(gl, gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    throw new Error("program link error: " + gl.getProgramInfoLog(prog));
+  }
+  return prog;
+}
+
+function loadTexture(gl, unit, src) {
+  const tex = gl.createTexture();
+  gl.activeTexture(gl.TEXTURE0 + unit);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  // 1x1 placeholder until the image arrives, so the first frames don't fail.
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]));
+
+  const img = new Image();
+  img.onload = () => {
+    gl.activeTexture(gl.TEXTURE0 + unit);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  };
+  img.onerror = () => console.error("failed to load texture:", src);
+  img.src = src;
+  return tex;
+}
+
+function main() {
+  const canvas = document.getElementById("gl");
+  const gl = canvas.getContext("webgl2");
+  if (!gl) {
+    document.body.innerHTML = '<p style="color:#eee;font:16px sans-serif;padding:2em">WebGL2 is not available in this browser.</p>';
+    return;
+  }
+
+  const prog = link(gl, VERT_SRC, FRAG_SRC);
+  gl.useProgram(prog);
+
+  const emptyVao = gl.createVertexArray();
+  gl.bindVertexArray(emptyVao);
+
+  const assets = embeddedAssets() || ASSET_PATHS;
+  const texBase = loadTexture(gl, 0, assets.base);
+  const texLight = loadTexture(gl, 1, assets.light);
+  const texFloor = loadTexture(gl, 2, assets.floor);
+  const texWindows = loadTexture(gl, 3, assets.windows);
+  const texAir = loadTexture(gl, 4, assets.air);
+
+  const uTime = gl.getUniformLocation(prog, "u_time");
+  const uDayPhase = gl.getUniformLocation(prog, "u_dayPhase");
+  const uSignatureStart = gl.getUniformLocation(prog, "u_signatureStart");
+  const uResolution = gl.getUniformLocation(prog, "u_resolution");
+  const uMotion = gl.getUniformLocation(prog, "u_motion");
+  gl.uniform1i(gl.getUniformLocation(prog, "u_baseTex"), 0);
+  gl.uniform1i(gl.getUniformLocation(prog, "u_lightTex"), 1);
+  gl.uniform1i(gl.getUniformLocation(prog, "u_floorTex"), 2);
+  gl.uniform1i(gl.getUniformLocation(prog, "u_windowsTex"), 3);
+  gl.uniform1i(gl.getUniformLocation(prog, "u_airTex"), 4);
+
+  // ---- state, mirroring the Quickshell Timer-driven uniforms ----
+  const state = {
+    time: 0,
+    dayPhase: 12,
+    speed: 1,
+    motion: 2.0,
+    signatureStart: -1000,
+    realClock: true,
+  };
+
+  function currentHours() {
+    const d = new Date();
+    return d.getHours() + d.getMinutes() / 60 + d.getSeconds() / 3600;
+  }
+
+  const phaseSlider = document.getElementById("phaseSlider");
+  const phaseReadout = document.getElementById("phaseReadout");
+  const realClockBox = document.getElementById("realClock");
+  const speedSlider = document.getElementById("speedSlider");
+  const speedReadout = document.getElementById("speedReadout");
+  const motionSlider = document.getElementById("motionSlider");
+  const motionReadout = document.getElementById("motionReadout");
+  const sigBtn = document.getElementById("sigBtn");
+
+  function fmtHours(h) {
+    h = ((h % 24) + 24) % 24;
+    const hh = Math.floor(h);
+    const mm = Math.floor((h - hh) * 60);
+    return String(hh).padStart(2, "0") + ":" + String(mm).padStart(2, "0");
+  }
+
+  phaseSlider.addEventListener("input", () => {
+    if (!state.realClock) {
+      state.dayPhase = parseFloat(phaseSlider.value);
+      phaseReadout.textContent = fmtHours(state.dayPhase);
+    }
+  });
+  realClockBox.addEventListener("change", () => {
+    state.realClock = realClockBox.checked;
+    phaseSlider.disabled = state.realClock;
+    if (!state.realClock) {
+      phaseSlider.value = state.dayPhase;
+    }
+  });
+  speedSlider.addEventListener("input", () => {
+    state.speed = parseFloat(speedSlider.value);
+    speedReadout.textContent = state.speed.toFixed(1) + "x";
+  });
+  motionSlider.addEventListener("input", () => {
+    state.motion = parseFloat(motionSlider.value);
+    motionReadout.textContent = state.motion.toFixed(1) + "x";
+  });
+  sigBtn.addEventListener("click", () => {
+    state.signatureStart = state.time;
+  });
+  phaseSlider.disabled = state.realClock;
+
+  function resize() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const w = Math.round(window.innerWidth * dpr);
+    const h = Math.round(window.innerHeight * dpr);
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
+      gl.viewport(0, 0, w, h);
+    }
+    if (fleetCanvas.width !== w || fleetCanvas.height !== h) {
+      fleetCanvas.width = w;
+      fleetCanvas.height = h;
+    }
+  }
+  window.addEventListener("resize", resize);
+  resize();
+
+  // ---- holo-golden fleet overlay (BRIEF-2 item 3) -------------------------
+  // A few illustrative nodes/links/one pulse in holo-golden's warm palette,
+  // drawn on a 2D canvas on top of the WebGL backdrop, so the colour
+  // combination can be judged here without a live fleet or Quickshell.
+  // Mirrors holo-golden/shell.qml's palette + night-cooling (not its real
+  // layout/data model -- this is a fixed illustrative scene, not a Renderer.js
+  // port).
+  const fleetCanvas = document.getElementById("fleetOverlay");
+  const fctx = fleetCanvas.getContext("2d");
+  const fleetToggle = document.getElementById("fleetToggle");
+
+  const FLEET_NIGHT_H = [0.0, 5.0, 7.0, 12.0, 17.0, 19.5, 21.0, 24.0];
+  const FLEET_NIGHT_N = [1.00, 1.00, 0.00, 0.00, 0.00, 0.40, 0.90, 1.00];
+  function fleetNightAmount(h) {
+    h = ((h % 24) + 24) % 24;
+    for (let i = 0; i < FLEET_NIGHT_H.length - 1; i++) {
+      if (h >= FLEET_NIGHT_H[i] && h <= FLEET_NIGHT_H[i + 1]) {
+        let t = (h - FLEET_NIGHT_H[i]) / Math.max(FLEET_NIGHT_H[i + 1] - FLEET_NIGHT_H[i], 0.0001);
+        t = t * t * (3 - 2 * t);
+        return FLEET_NIGHT_N[i] + (FLEET_NIGHT_N[i + 1] - FLEET_NIGHT_N[i]) * t;
+      }
+    }
+    return FLEET_NIGHT_N[0];
+  }
+  const NIGHT_SILVER = [140, 173, 242]; // #8cadf2 -- same hex as studio's own moonGlow tint
+  function mixRgb(a, b, t) {
+    return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+  }
+  function rgbStr(c, a) {
+    return `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a})`;
+  }
+  const GOLD_LINE = [184, 134, 74];   // #b8864a -- thin gilded threads
+  const GOLD_WORK = [232, 168, 76];   // #e8a84c -- ember/amber, working node
+  const GOLD_DIM = [168, 103, 74];    // #a8674a -- soft terracotta, idle node
+  const GOLD_PULSE = [255, 242, 218]; // #fff2da -- cream-white, one crisp point of light
+
+  // Fixed illustrative layout, in 1920x1080 reference space (scaled to the
+  // canvas below) -- two "VPS" nodes lower-left, one "P1" node upper-right,
+  // echoing holo's left/right machine split without reimplementing it.
+  const FLEET_NODES = [
+    { x: 160, y: 780, r: 26, working: true },
+    { x: 340, y: 900, r: 20, working: false },
+    { x: 1680, y: 260, r: 24, working: true },
+  ];
+  const FLEET_LINKS = [[0, 1], [0, 2]];
+  let pulseLinkIdx = 0;
+
+  function drawFleetOverlay(nowSec) {
+    fctx.clearRect(0, 0, fleetCanvas.width, fleetCanvas.height);
+    if (!fleetToggle.checked) return;
+
+    const night = fleetNightAmount(state.dayPhase);
+    const lineColor = mixRgb(GOLD_LINE, NIGHT_SILVER, night);
+    const workColor = mixRgb(GOLD_WORK, NIGHT_SILVER, night);
+    const dimColor = mixRgb(GOLD_DIM, NIGHT_SILVER, night);
+    const pulseColor = mixRgb(GOLD_PULSE, NIGHT_SILVER, night);
+
+    const sx = fleetCanvas.width / 1920;
+    const sy = fleetCanvas.height / 1080;
+    const px = (x) => x * sx;
+    const py = (y) => y * sy;
+
+    function controlPoint(a, b) {
+      return [(px(a.x) + px(b.x)) / 2, py(Math.min(a.y, b.y)) - 90 * sy];
+    }
+
+    fctx.lineWidth = Math.max(1, 1.4 * Math.min(sx, sy));
+    FLEET_LINKS.forEach(([ai, bi]) => {
+      const a = FLEET_NODES[ai], b = FLEET_NODES[bi];
+      const c = controlPoint(a, b);
+      fctx.strokeStyle = rgbStr(lineColor, 0.55);
+      fctx.beginPath();
+      fctx.moveTo(px(a.x), py(a.y));
+      fctx.quadraticCurveTo(c[0], c[1], px(b.x), py(b.y));
+      fctx.stroke();
+    });
+
+    FLEET_NODES.forEach((n) => {
+      const c = n.working ? workColor : dimColor;
+      const r = n.r * Math.min(sx, sy);
+      const grad = fctx.createRadialGradient(px(n.x), py(n.y), 0, px(n.x), py(n.y), r * 2.2);
+      grad.addColorStop(0, rgbStr(c, n.working ? 0.55 : 0.30));
+      grad.addColorStop(1, rgbStr(c, 0));
+      fctx.fillStyle = grad;
+      fctx.beginPath();
+      fctx.arc(px(n.x), py(n.y), r * 2.2, 0, Math.PI * 2);
+      fctx.fill();
+
+      fctx.fillStyle = rgbStr([20, 13, 8], 1);
+      fctx.beginPath();
+      fctx.arc(px(n.x), py(n.y), r, 0, Math.PI * 2);
+      fctx.fill();
+      fctx.strokeStyle = rgbStr(c, n.working ? 0.9 : 0.5);
+      fctx.lineWidth = Math.max(1, 2 * Math.min(sx, sy));
+      fctx.stroke();
+    });
+
+    // one pulse, one crisp point of light, no trails/echoes -- travels one
+    // link every 6s then hands off to the next link, looping.
+    const period = 6.0;
+    const cycle = FLEET_LINKS.length * period;
+    const tAll = nowSec % cycle;
+    const linkIdx = Math.floor(tAll / period);
+    const tLocal = (tAll - linkIdx * period) / period;
+    const [ai, bi] = FLEET_LINKS[linkIdx];
+    const a = FLEET_NODES[ai], b = FLEET_NODES[bi];
+    const c = controlPoint(a, b);
+    const u = 1 - tLocal;
+    const pxp = u * u * px(a.x) + 2 * u * tLocal * c[0] + tLocal * tLocal * px(b.x);
+    const pyp = u * u * py(a.y) + 2 * u * tLocal * c[1] + tLocal * tLocal * py(b.y);
+    const glow = fctx.createRadialGradient(pxp, pyp, 0, pxp, pyp, 17 * Math.min(sx, sy));
+    glow.addColorStop(0, rgbStr(pulseColor, 0.95));
+    glow.addColorStop(0.4, rgbStr(pulseColor, 0.4));
+    glow.addColorStop(1, rgbStr(pulseColor, 0));
+    fctx.fillStyle = glow;
+    fctx.beginPath();
+    fctx.arc(pxp, pyp, 17 * Math.min(sx, sy), 0, Math.PI * 2);
+    fctx.fill();
+  }
+
+  // auto-fade the control strip when idle
+  const hud = document.getElementById("hud");
+  let idleTimer = null;
+  function wake() {
+    hud.classList.remove("dim");
+    clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => hud.classList.add("dim"), 3500);
+  }
+  window.addEventListener("pointermove", wake);
+  wake();
+
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.1, (now - last) / 1000);
+    last = now;
+
+    state.time += dt * state.speed;
+    if (state.time > 100000) {
+      state.time -= 100000;
+      if (state.signatureStart > -999) state.signatureStart -= 100000;
+    }
+    if (state.realClock) {
+      state.dayPhase = currentHours();
+      phaseSlider.value = state.dayPhase;
+      phaseReadout.textContent = fmtHours(state.dayPhase);
+    }
+
+    gl.uniform1f(uTime, state.time);
+    gl.uniform1f(uDayPhase, state.dayPhase);
+    gl.uniform1f(uSignatureStart, state.signatureStart);
+    gl.uniform2f(uResolution, canvas.width, canvas.height);
+    gl.uniform1f(uMotion, state.motion);
+
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    drawFleetOverlay(state.time);
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+}
+
+main();
+</script>
+</body>
+</html>

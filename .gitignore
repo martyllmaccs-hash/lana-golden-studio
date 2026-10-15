@@ -1,0 +1,5 @@
+checks/p1/
+holo-ref/
+*.qsb
+__pycache__/
+.venv/
